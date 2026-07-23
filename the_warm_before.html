@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Red-Blue Neural Field</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'low-power' });
+if (!gl) { document.body.innerHTML = '<p style="color:white;font-family:sans-serif">WebGL not supported.</p>'; }
+
+const isMobile = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 820;
+const OCTAVES = isMobile ? 4 : 6;
+const RENDER_SCALE = isMobile ? 0.62 : 1.0;
+const DPR_CAP = isMobile ? 1.0 : Math.min(window.devicePixelRatio || 1, 2.0);
+
+function resize() {
+  const w = Math.floor(window.innerWidth * DPR_CAP * RENDER_SCALE);
+  const h = Math.floor(window.innerHeight * DPR_CAP * RENDER_SCALE);
+  canvas.width = w;
+  canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const vertSrc = `
+attribute vec2 aPos;
+void main() {
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}
+`;
+
+const fragSrc = `
+precision mediump float;
+uniform vec2 uRes;
+uniform float uTime;
+uniform vec2 uLook;
+
+float hash21(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+vec2 hash22(vec2 p) {
+  float n = hash21(p);
+  float n2 = hash21(p + 17.13);
+  return vec2(n, n2);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p) {
+  float v = 0.0;
+  float amp = 0.5;
+  mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+  for (int i = 0; i < ${OCTAVES}; i++) {
+    v += amp * noise(p);
+    p = rot * p * 2.02;
+    amp *= 0.55;
+  }
+  return v;
+}
+
+float ridged(vec2 p) {
+  float v = fbm(p);
+  return 1.0 - abs(2.0 * v - 1.0);
+}
+
+float veins(vec2 p, float t) {
+  vec2 q = p + vec2(t * 0.004, -t * 0.003);
+  float n1 = ridged(q * 2.2);
+  float n2 = ridged(q * 4.5 + 8.2);
+  float n = pow(n1, 5.0) * 0.7 + pow(n2, 7.0) * 0.4;
+  return n;
+}
+
+float particleLayer(vec2 uv, float t, float cellSize, float speed, float seed, float parallaxAmt) {
+  vec2 parallaxUv = uv - uLook * parallaxAmt;
+  vec2 grid = parallaxUv / cellSize;
+  vec2 cellId = floor(grid);
+  vec2 f = fract(grid);
+  float dx = f.x < 0.5 ? -1.0 : 1.0;
+  float dy = f.y < 0.5 ? -1.0 : 1.0;
+  float glow = 0.0;
+
+  for (int yi = 0; yi < 2; yi++) {
+    for (int xi = 0; xi < 2; xi++) {
+      vec2 neighbor = vec2(xi == 0 ? 0.0 : dx, yi == 0 ? 0.0 : dy);
+      vec2 id = cellId + neighbor;
+      vec2 rnd = hash22(id + seed);
+
+      float drift = fract(t * speed * (0.3 + rnd.x * 0.7) + rnd.y);
+      vec2 dir = normalize(hash22(id + seed + 3.7) * 2.0 - 1.0);
+      vec2 pos = fract(rnd + dir * drift * 0.9);
+
+      vec2 cellUv = grid - id;
+      vec2 diff = cellUv - pos;
+
+      float dist = length(diff);
+
+      float tw = 0.5 + 0.5 * sin(t * (1.2 + rnd.x * 1.6) + rnd.y * 6.2831);
+
+      float size = mix(0.014, 0.05, rnd.y) * (0.7 + 0.3 * tw);
+      float core = smoothstep(size * 0.32, 0.0, dist);
+      float halo = exp(-(dist * dist) / (size * size * 3.0));
+
+      glow += (core * 1.3 + halo * 0.55) * (0.4 + 0.6 * tw);
+    }
+  }
+  return glow;
+}
+
+void main() {
+  vec2 p = (gl_FragCoord.xy - 0.5 * uRes.xy) / min(uRes.x, uRes.y);
+  vec2 puv = p + vec2(0.5);
+
+  float t = uTime;
+
+  float breathe = 0.5 + 0.5 * sin(t * 0.35);
+  float breatheSlow = 0.5 + 0.5 * sin(t * 0.22 + 2.0);
+
+  float radial = length(p * vec2(1.0, 1.1)) * mix(0.94, 1.06, breathe);
+  vec3 deepGold  = vec3(0.14, 0.03, 0.01);
+  vec3 midAmber  = vec3(0.62, 0.12, 0.04);
+  vec3 hotRed    = vec3(0.97, 0.14, 0.09);
+
+  vec3 col = mix(hotRed, deepGold, smoothstep(0.0, 1.1, radial));
+  col = mix(col, midAmber, 0.35);
+
+  float cloud = fbm(p * 1.5 + vec2(0.0, t * 0.01));
+  col *= (0.75 + 0.5 * cloud);
+
+  float v = veins(p * 1.4, t);
+  vec3 veinColor = mix(vec3(0.5, 0.03, 0.08), vec3(1.0, 0.45, 0.14), v);
+  col += veinColor * v * (1.1 + 0.4 * breatheSlow);
+
+  float v2 = veins(p * 3.1 + 4.0, t * 1.3);
+  col += vec3(1.0, 0.4, 0.12) * pow(v2, 2.0) * (0.5 + 0.25 * breathe);
+
+  float centerGlow = exp(-radial * radial * mix(1.8, 2.6, breathe));
+  col += vec3(0.97, 0.22, 0.1) * centerGlow * (0.4 + 0.3 * breathe);
+
+  float p1 = particleLayer(puv, t, 0.16, 0.045, 1.0, 0.0);
+  float p2 = particleLayer(puv, t, 0.10, 0.03, 27.0, 0.0);
+  float p3 = particleLayer(puv, t, 0.24, 0.02, 71.0, 0.0);
+
+  vec3 sparkColor = vec3(1.0, 0.8, 0.55);
+  col += sparkColor * p1 * 1.2;
+  col += sparkColor * p2 * 0.9;
+  col += sparkColor * p3 * 1.5;
+
+  float vig = smoothstep(1.3, 0.2, radial);
+  col *= vig;
+
+  col = col / (1.0 + col * 0.6);
+  col = pow(col, vec3(0.92));
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+const vs = compile(gl.VERTEX_SHADER, vertSrc);
+const fs = compile(gl.FRAGMENT_SHADER, fragSrc);
+const prog = gl.createProgram();
+gl.attachShader(prog, vs);
+gl.attachShader(prog, fs);
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  console.error(gl.getProgramInfoLog(prog));
+}
+gl.useProgram(prog);
+
+const quad = new Float32Array([
+  -1, -1,  1, -1,  -1, 1,
+  -1, 1,   1, -1,   1, 1
+]);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+const aPos = gl.getAttribLocation(prog, 'aPos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const uRes = gl.getUniformLocation(prog, 'uRes');
+const uTime = gl.getUniformLocation(prog, 'uTime');
+const uLook = gl.getUniformLocation(prog, 'uLook');
+
+const start = performance.now();
+
+const FRAME_INTERVAL = isMobile ? 1000 / 30 : 0;
+let lastFrameTime = 0;
+
+function render(now) {
+  requestAnimationFrame(render);
+  if (FRAME_INTERVAL && now - lastFrameTime < FRAME_INTERVAL) return;
+  lastFrameTime = now;
+
+  const t = (now - start) / 1000.0;
+
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, t);
+  gl.uniform2f(uLook, 0, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
