@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Molten Silver Swirls</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'low-power' });
+if (!gl) { document.body.innerHTML = '<p style="color:white;font-family:sans-serif">WebGL not supported.</p>'; }
+
+const isMobile = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 820;
+const WARP_LAYERS = isMobile ? 3 : 5;  
+const DETAIL_OCTAVES = isMobile ? 3 : 5; 
+const RENDER_SCALE = isMobile ? 0.62 : 1.0;
+const DPR_CAP = isMobile ? 1.0 : Math.min(window.devicePixelRatio || 1, 2.0);
+
+function resize() {
+  const w = Math.floor(window.innerWidth * DPR_CAP * RENDER_SCALE);
+  const h = Math.floor(window.innerHeight * DPR_CAP * RENDER_SCALE);
+  canvas.width = w;
+  canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const vertSrc = `
+attribute vec2 aPos;
+void main() {
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}
+`;
+
+const fragSrc = `
+precision mediump float;
+uniform vec2 uRes;
+uniform float uTime;
+
+float hash21(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+vec2 hash22(vec2 p) {
+  float n = hash21(p);
+  float n2 = hash21(p + 17.13);
+  return vec2(n, n2);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p) {
+  float v = 0.0;
+  float amp = 0.5;
+  mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+  for (int i = 0; i < ${DETAIL_OCTAVES}; i++) {
+    v += amp * noise(p);
+    p = rot * p * 2.02;
+    amp *= 0.55;
+  }
+  return v;
+}
+
+float ridged(vec2 p) {
+  float v = fbm(p);
+  return 1.0 - abs(2.0 * v - 1.0);
+}
+
+vec2 vortexPass(vec2 p, float scale, float strength, float t, float seed) {
+  vec2 gv = p * scale;
+  vec2 id = floor(gv);
+  vec2 f = fract(gv);
+
+  vec2 totalDisp = vec2(0.0);
+
+  for (int y = -1; y <= 1; y++) {
+    for (int x = -1; x <= 1; x++) {
+      vec2 offs = vec2(float(x), float(y));
+      vec2 cid = id + offs;
+      vec2 center = hash22(cid + seed);
+      vec2 diff = (f - offs) - center;
+      float d = length(diff);
+
+      float w = exp(-d * d * 5.0);
+
+      float spin = hash21(cid + seed + 4.1) * 2.0 - 1.0;
+      float angle = strength * spin * w * sin(t * 0.15 + hash21(cid + seed) * 6.2831);
+      float s = sin(angle);
+      float c = cos(angle);
+      mat2 rot = mat2(c, -s, s, c);
+      vec2 warpedDiff = rot * diff;
+
+      totalDisp += (warpedDiff - diff) * w;
+    }
+  }
+
+  return (gv + totalDisp) / scale;
+}
+
+void main() {
+  vec2 p = (gl_FragCoord.xy - 0.5 * uRes.xy) / min(uRes.x, uRes.y);
+  float t = uTime;
+
+  vec2 q = p * 1.6;
+  q = vortexPass(q, 1.3, 2.2, t, 3.0);
+  q = vortexPass(q, 2.6, 1.6, t * 1.15, 11.0);
+  #if ${WARP_LAYERS} > 2
+  q = vortexPass(q, 5.0, 1.1, t * 0.85, 27.0);
+  #endif
+  #if ${WARP_LAYERS} > 3
+  q = vortexPass(q, 9.0, 0.7, t * 1.3, 51.0);
+  #endif
+  #if ${WARP_LAYERS} > 4
+  q = vortexPass(q, 15.0, 0.45, t * 0.7, 83.0);
+  #endif
+
+  float threads = ridged(q * 2.4);
+  threads = pow(threads, 3.6);
+
+  float threadsFine = ridged(q * 5.1 + 9.0);
+  threadsFine = pow(threadsFine, 5.0);
+
+  float sheen = fbm(p * 1.1 + vec2(0.0, t * 0.008));
+
+  vec3 base = vec3(0.003, 0.004, 0.01);
+  vec3 blueUndertone = vec3(0.02, 0.025, 0.06);
+  vec3 silver = vec3(0.65, 0.68, 0.8);
+  vec3 coolBlue = vec3(0.16, 0.19, 0.4);
+
+  vec3 col = mix(base, blueUndertone, sheen * 0.5);
+  col += coolBlue * threads * 0.4;
+  col += silver * threadsFine * 0.85;
+  col += silver * threads * threadsFine * 0.5;
+
+  float glint = pow(threads * threadsFine, 3.0);
+  col += vec3(0.9, 0.92, 1.0) * glint * 1.6;
+
+  float radial = length(p * vec2(1.0, 1.0));
+  float vig = smoothstep(1.15, 0.15, radial);
+  col *= mix(0.18, 1.0, vig);
+
+  col = col / (1.0 + col * 0.7);
+  col = pow(col, vec3(1.35));
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+const vs = compile(gl.VERTEX_SHADER, vertSrc);
+const fs = compile(gl.FRAGMENT_SHADER, fragSrc);
+const prog = gl.createProgram();
+gl.attachShader(prog, vs);
+gl.attachShader(prog, fs);
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  console.error(gl.getProgramInfoLog(prog));
+}
+gl.useProgram(prog);
+
+const quad = new Float32Array([
+  -1, -1,  1, -1,  -1, 1,
+  -1, 1,   1, -1,   1, 1
+]);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+const aPos = gl.getAttribLocation(prog, 'aPos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const uRes = gl.getUniformLocation(prog, 'uRes');
+const uTime = gl.getUniformLocation(prog, 'uTime');
+
+const start = performance.now();
+const FRAME_INTERVAL = isMobile ? 1000 / 30 : 0;
+let lastFrameTime = 0;
+
+function render(now) {
+  requestAnimationFrame(render);
+  if (FRAME_INTERVAL && now - lastFrameTime < FRAME_INTERVAL) return;
+  lastFrameTime = now;
+
+  const t = (now - start) / 1000.0;
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, t);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
