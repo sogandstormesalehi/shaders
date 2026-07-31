@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fingertip // dormant</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #05060a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<script>
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false });
+const derivExt = gl.getExtension('OES_standard_derivatives');
+if (!derivExt) console.warn('OES_standard_derivatives unavailable — shading will fail.');
+
+const MAX_DPR = 1.75;
+function resize() {
+  const s = Math.min(devicePixelRatio || 1, MAX_DPR);
+  canvas.width  = Math.round(window.innerWidth  * s);
+  canvas.height = Math.round(window.innerHeight * s);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const vertSrc = `
+attribute vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+`;
+
+const fragSrc = `
+#extension GL_OES_standard_derivatives : enable
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+uniform vec2  u_res;
+uniform float u_time;
+
+#define RIDGE_FREQ   98.0        
+#define CORE_POS     vec2( 0.00,  0.99)   // loop core   (multiplicity 1)
+#define DELTA_POS    vec2( 0.24, -2.96)   // delta       (multiplicity 3)
+#define POLE_POS     vec2( 0.00, -2.00)   // far pole    (multiplicity -2)
+#define PHASE_OFFSET -1.4         // rotates core opening + far-field tilt
+#define M_MAX        2.8          // spacing-normalisation clamp
+#define FING_A       1.68         // fingertip half width
+#define FING_B       2.05         // fingertip half length
+#define FING_CY     -0.12         // centre offset
+#define DEPTH        0.12         // out-of-screen bulge
+#define BUMP         .5115       // ridge relief strength
+
+float hash11(float n){ return fract(sin(n * 927.1) * 43758.5453123); }
+
+float hash21(vec2 p){
+  p = fract(p * vec2(127.1, 311.7));
+  p += dot(p, p + 34.23);
+  return fract(p.x * p.y);
+}
+
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i),            b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0)), d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p){
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++){
+    v += a * vnoise(p);
+    p = p * 2.03 + vec2(1.7, -3.1);
+    a *= 0.52;
+  }
+  return v;
+}
+vec2 fbm2(vec2 p){ return vec2(fbm(p), fbm(p + vec2(19.3, 7.7))); }
+
+void addSing(vec2 z, vec2 s, float m, inout float th, inout vec2 V){
+  vec2  w  = z - s;
+  float r2 = max(dot(w, w), 1e-6);
+  th += m * atan(w.y, w.x);
+  V  += m * vec2(w.x, -w.y) / r2;
+}
+
+void ridgeField(vec2 z, out float thOut, out vec2 VOut){
+  float th = PHASE_OFFSET;
+  vec2  V  = vec2(0.0);
+  addSing(z, CORE_POS,   1.0, th, V);
+  addSing(z, DELTA_POS,  3.0, th, V);
+  addSing(z, POLE_POS,  -2.0, th, V);
+
+  for (int i = 0; i < 9; i++){
+    float fi = float(i);
+    vec2  c  = vec2(sin(fi * 12.9898) * 0.40, cos(fi * 7.233) * 0.44 - 0.05);
+    float a  = fract(sin(fi * 43.21) * 437.5) * 6.2831853;
+    vec2  d  = 0.045 * vec2(cos(a), sin(a));
+    addSing(z, c + d,  2.0, th, V);
+    addSing(z, c - d, -2.0, th, V);
+  }
+  thOut = th;
+  VOut  = V;
+}
+
+float prof(float x){ return clamp(0.5 + 0.5 * cos(x) + 0.06 * cos(2.0 * x) - 0.06, 0.0, 1.0); }
+float dprof(float x){ return -(0.5 * sin(x) + 0.12 * sin(2.0 * x)); }
+
+float crease(vec2 z, float cy, float amp, float ph, float wid){
+  float d = abs(z.y - (cy + amp * sin(z.x * ph + cy * 7.0)));
+  return 1.0 - smoothstep(wid * 0.35, wid, d);
+}
+
+float twitch(float t){
+  float seg  = floor(t / 23.0);
+  float lt   = t - seg * 13.0;
+  float when = 4.0 + hash11(seg) * 7.0;
+  float d    = lt - when;
+  return exp(-max(d, 0.0) * 26.0) * step(0.0, d) * sin(d * 46.0);
+}
+
+void main(){
+  float minRes = min(u_res.x, u_res.y);
+  vec2  p = (2.0 * gl_FragCoord.xy - u_res) / minRes;
+  float T = u_time;
+
+  float tw = twitch(T);
+  vec2  drift = vec2(sin(T * 0.17) * 0.012 + tw * 0.006,
+                     cos(T * 0.05) * 0.110 + tw * 0.004);
+  vec2  q   = p - vec2(drift.x, FING_CY + drift.y);
+  float sx  = q.x / FING_A;
+  float syt = max(q.y, 0.0) / FING_B;
+  float f   = 1.0 - sx * sx - syt * syt;             // >0 inside
+
+  float sil = smoothstep(0.0, fwidth(f) * 1.5 + 0.001, f);
+  float sf  = sqrt(max(f, 0.004));
+  float zs  = DEPTH * sf;
+
+  vec3 Nb = normalize(vec3(DEPTH * sx / (FING_A * sf),
+                           q.y > 0.0 ? DEPTH * syt / (FING_B * sf) : 0.0,
+                           1.0));
+
+  float press   = 0.55 + 0.18 * sin(T * 0.42) + tw * 0.10;
+  float zc      = DEPTH * (1.0 - 0.16 * press);
+  float fc      = (zc / DEPTH) * (zc / DEPTH);
+  float contact = smoothstep(fc, fc + 0.10, f);
+  vec3  Nf      = normalize(mix(Nb, vec3(0.0, 0.0, 1.0), contact));
+  float defocus = clamp((zc - zs) / 0.20, 0.0, 1.0);   // camera focused on glass
+
+  float rho = length(vec2(sx, syt));
+  float sc  = rho > 1e-4 ? asin(min(rho, 2.995)) / max(rho, 1e-4) : 1.0;
+  vec2  Z   = vec2(sx * FING_A, syt * FING_B) * sc + vec2(0.0, min(q.y, 0.0));
+  Z *= 1.0 - 0.05 * contact * press;                  // skin spreads under load
+
+  vec2 Zw = Z + 0.055 * (fbm2(Z * 1.9) - 0.5)         // organic ridge flow
+              + 0.010 * (fbm2(Z * 7.0 + 11.0) - 0.5); // fine wobble
+
+  float th; vec2 V;
+  ridgeField(Zw, th, V);
+
+  vec2  dZx = vec2(dFdx(Zw.x), dFdy(Zw.x));
+  vec2  dZy = vec2(dFdx(Zw.y), dFdy(Zw.y));
+  vec2  gTh = V.y * dZx + V.x * dZy;                 
+
+  float L  = length(V);
+  float Mc = 2.0 / M_MAX;
+  float M  = 2.0 / sqrt(L * L + Mc * Mc);
+  vec2  gM = vec2(dFdx(M), dFdy(M));
+
+  float st = sin(th * 0.5), ct = cos(th * 0.5);
+  float PHI  = st * M;
+  vec2  gPHI = 0.5 * ct * M * gTh + st * gM;
+
+  float x    = RIDGE_FREQ * PHI;
+  float freq = RIDGE_FREQ * length(gPHI);            
+  float aa   = 1.0 - smoothstep(1.1, 2.6, freq);    
+
+  float cr = max(crease(Zw,  0.34, 0.10, 3.1, 0.028) * 0.85,
+                 crease(Zw, -0.22, 0.07, 2.2, 0.020) * 0.70);
+  cr = max(cr, crease(Zw, -0.52, 0.05, 4.0, 0.016) * 0.60);
+
+  float amp = aa
+            * (1.0 - 0.55 * defocus)
+            * (1.0 - 0.90 * cr)
+            * (1.0 - 0.25 * contact * press)          
+            * clamp(Nf.z * 1.6, 0.0, 1.0);
+
+  float ca = 0.05 * length(p);                    
+  vec3  hRGB = vec3(prof(x + ca), prof(x), prof(x - ca));
+  float r  = hRGB.g;
+  float dr = dprof(x);
+
+  vec2  gi   = floor(Zw / 0.002);
+  vec2  gf   = fract(Zw / 0.052);
+  vec2  jit  = vec2(hash21(gi), hash21(gi + vec2(5.2, 1.3)));
+  float pd   = length(gf - jit);
+  float pore = (1.0 - smoothstep(0.09, 0.16, pd))
+             * smoothstep(0.55, 0.90, r)
+             * (1.0 - defocus)
+             * step(0.45, hash21(gi + vec2(2.7, 9.1)));
+
+  float h = r * amp - pore * 0.00 * amp;
+
+  vec2 gW = dr * RIDGE_FREQ * gPHI * amp * (minRes * 0.5);
+  vec3 N  = normalize(Nf + vec3(-gW * BUMP, 0.0));
+
+  float mot  = fbm(Z * 99.6 + 4.0);
+  float mot2 = fbm(Z * 99.0 - 2.0);
+  float lv   = smoothstep(0.45, 0.80, mot)  * 0.95;   
+  float jn   = smoothstep(0.60, 0.90, mot2) * 1.25; 
+
+  vec3 alb = mix(vec3(0.80, 0.685, 0.635), vec3(0.50, 0.53, 0.60), lv);
+  alb = mix(alb, vec3(0.66, 0.60, 0.44), jn);
+
+  float blanch = clamp(contact * press * 1.3, 0.0, 1.0) * smoothstep(0.2, 0.8, h);
+  alb = mix(alb, vec3(0.93, 0.88, 0.85), blanch * 0.5);
+  alb *= 0.96 + 0.52 * (hRGB * amp - pore * 0.55 * amp);   
+  vec3  Ldir = normalize(vec3(-0.42, 0.60, 0.68));
+  float ndl  = dot(N, Ldir);
+  float diff = max(ndl, 0.0);
+  float wrap = max((ndl + 0.5) / 1.5, 0.0);
+  vec3  Hh   = normalize(Ldir + vec3(0.0, 0.0, 1.0));
+  float ndh  = max(dot(N, Hh), 0.0);
+
+  float gloss = 0.95 + 0.55 * contact;              
+  float spec  = pow(ndh, 30.0 + 70.0 * contact) * gloss * (1.0 - 0.5 * defocus);
+  float ao    = 0.55 + 0.45 * clamp(h * 1.2, 0.0, 1.0);
+  float thin  = clamp(1.0 - sf / 0.9, 0.0, 1.0);
+  float sss   = pow(wrap, 2.2) * (0.25 + 0.75 * thin);
+
+  vec3 col = alb * (vec3(0.075, 0.095, 0.125) + diff * vec3(0.66, 0.74, 0.84) * 1.38) * ao;
+  col += vec3(0.55, 0.14, 0.09) * sss * 0.32;        
+  col += spec * vec3(0.85, 0.92, 1.0) * 0.5;
+
+  float glow = pow(clamp(1.0 - length(vec2(q.x, q.y * 0.8)) / 1.5, 0.0, 1.0), 3.0);
+  vec3  bg   = vec3(0.020, 0.024, 0.030) + vec3(0.05, 0.045, 0.05) * glow * 0.35;
+  col = mix(bg, col, sil);
+
+  float fog = pow(clamp(2.0 - length(vec2(p.x, (p.y + 0.25) * 1.25)) / 1.05, 0.0, 1.0), 1.6)
+            * (0.35 + 0.25 * sin(T * 0.5));
+  fog *= 0.6 + 0.5 * fbm(p * 2.2 + 7.0);
+  fog *= 1.0 - contact * 0.9;
+  col = col * (1.0 - fog * 0.32) + vec3(0.30, 0.34, 0.38) * fog * 0.16;
+
+  col *= 0.88 + 0.24 * fbm(p * 3.1 + 21.0);
+  col *= clamp(1.0 - 0.42 * pow(length(p), 2.2), 0.0, 1.0);
+  col += (hash21(gl_FragCoord.xy + fract(T) * 61.0) - 0.5) * 0.035;
+
+  gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vertSrc));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fragSrc));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1,  1, -1,  -1, 1,
+  -1,  1,  1, -1,   1, 1
+]), gl.STATIC_DRAW);
+const posLoc = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+const u_res  = gl.getUniformLocation(prog, 'u_res');
+const u_time = gl.getUniformLocation(prog, 'u_time');
+
+const start = performance.now();
+let raf = 0;
+function frame() {
+  const t = (performance.now() - start) / 1000;
+  gl.uniform2f(u_res, canvas.width, canvas.height);
+  gl.uniform1f(u_time, t);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  raf = requestAnimationFrame(frame);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) cancelAnimationFrame(raf);
+  else raf = requestAnimationFrame(frame);
+});
+frame();
+</script>
+</body>
+</html>
