@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dendrite field</title>
+<style>
+  :root {
+    --ink: #000;
+    --paper: #f2f0eb;
+    --dim: #6d6a63;
+    --rule: #2a2a28;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--ink); }
+  body {
+    font-family: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, monospace;
+    color: var(--paper);
+    overflow: hidden;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<script>
+const VERT = `#version 300 es
+in vec2 pos;
+void main(){ gl_Position = vec4(pos, 0.0, 1.0); }`;
+
+const FRAG = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uScale;
+uniform float uWarp;
+uniform float uBands;
+uniform float uPull;
+uniform float uSeed;
+
+vec2 hash2(vec2 p){
+  p += uSeed;
+  p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+  return -1.0 + 2.0 * fract(sin(p) * 43758.5453123);
+}
+
+float noise(vec2 p){
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(dot(hash2(i + vec2(0.0,0.0)), f - vec2(0.0,0.0)),
+                 dot(hash2(i + vec2(1.0,0.0)), f - vec2(1.0,0.0)), u.x),
+             mix(dot(hash2(i + vec2(0.0,1.0)), f - vec2(0.0,1.0)),
+                 dot(hash2(i + vec2(1.0,1.0)), f - vec2(1.0,1.0)), u.x), u.y);
+}
+
+const mat2 ROT = mat2(0.80, 0.60, -0.60, 0.80);
+
+float fbm(vec2 p){
+  float amp = 0.5, sum = 0.0;
+  for (int i = 0; i < 5; i++){
+    sum += amp * noise(p);
+    p = ROT * p * 2.03;
+    amp *= 0.5;
+  }
+  return sum;
+}
+
+vec2 flow(vec2 p, float t){
+  float a = fbm(p + vec2(0.0, 0.0) + 0.11 * t);
+  float b = fbm(p + vec2(5.2, 1.3) - 0.09 * t);
+  return mix(vec2(a, b), vec2(-b, a), uPull * 0.5);
+}
+
+float height(vec2 p, float t){
+  vec2 q = p;
+  for (int i = 0; i < 4; i++){
+    q += uWarp * flow(q + float(i) * vec2(3.1, 1.7), t);
+  }
+  return fbm(q);
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  vec2 p  = uv * uScale;
+
+  float h = height(p, uTime);
+  float v   = h * uBands;
+  float tri = abs(fract(v) - 0.5) * 2.0;
+  float w   = clamp(fwidth(v), 0.002, 0.45);
+  float c   = smoothstep(0.5 - w, 0.5 + w, tri);
+
+  c *= 1.0 - smoothstep(0.22, 0.45, w) * 0.35;
+  c  = clamp((c - 0.5) * 1.60 + 0.5, 0.0, 1.0);
+
+  fragColor = vec4(vec3(c), 1.0);
+}`;
+
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+
+if (!gl) {
+  document.body.innerHTML =
+    '<p style="font:12px monospace;color:#f2f0eb;padding:24px">' +
+    'This browser has no WebGL2 context. Try a current Chrome, Firefox, or Safari.</p>';
+} else {
+  const compile = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'pos');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const U = n => gl.getUniformLocation(prog, n);
+  const uRes = U('uRes'), uTime = U('uTime'), uScale = U('uScale'),
+        uWarp = U('uWarp'), uBands = U('uBands'), uPull = U('uPull'), uSeed = U('uSeed');
+
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const TAU = Math.PI * 2;
+
+  const wave = (t, a, b, phase) =>
+    0.62 * Math.sin(TAU * t / a + phase) +
+    0.38 * Math.sin(TAU * t / b + phase * 1.7);
+
+  const surge = (t, period, phase, power) =>
+    Math.pow(0.5 + 0.5 * Math.sin(TAU * t / period + phase), power);
+
+  const P = [
+    { lo: 1.50, hi: 9.00, a: 53, b: 31, ph: 0.0, base: 0.35, spike: 3.2, sp: 47, pw: 5 }, // scale
+    { lo: 0.05, hi: 1.15, a: 37, b: 19, ph: 1.3, base: 0.50, spike: 4.0, sp: 29, pw: 4 }, // warp
+    { lo: 2.50, hi: 29.0, a: 43, b: 23, ph: 2.6, base: 0.30, spike: 5.5, sp: 61, pw: 6 }, // bands
+    { lo: 0.00, hi: 1.50, a: 67, b: 17, ph: 4.1, base: 0.60, spike: 3.0, sp: 23, pw: 3 }  // pull
+  ];
+  P.forEach(p => { p.t = Math.random() * 100; });
+
+  const step = (p, dt, master) => {
+    p.t += dt * p.base * (0.12 + p.spike * surge(master, p.sp, p.ph, p.pw));
+    return p.lo + (p.hi - p.lo) * 0.5 * (1.0 + wave(p.t, p.a, p.b, p.ph));
+  };
+
+  let seed = Math.random() * 100;
+  let clock = 0, master = 0, last = performance.now(), running = true;
+
+  addEventListener('keydown', e => {
+    if (e.code === 'Space') { e.preventDefault(); running = !running; }
+    if (e.key === 'r' || e.key === 'R') seed = Math.random() * 100;
+  });
+
+  const resize = () => {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+      gl.viewport(0, 0, w, h);
+    }
+  };
+  addEventListener('resize', resize);
+  resize();
+
+  const frame = now => {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+
+    const adv = (running && !reduced) ? dt : 0;
+    master += adv;
+    clock += adv * (0.02 + 0.95 * surge(master, 71, 0.7, 4));
+
+    const v = P.map(p => step(p, adv, master));
+
+    resize();
+    gl.uniform2f(uRes, canvas.width, canvas.height);
+    gl.uniform1f(uTime, clock);
+    gl.uniform1f(uScale, v[0]);
+    gl.uniform1f(uWarp,  v[1]);
+    gl.uniform1f(uBands, v[2]);
+    gl.uniform1f(uPull,  v[3]);
+    gl.uniform1f(uSeed, seed);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
