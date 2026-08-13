@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Home -1</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 position;
+void main() {
+  gl_Position = vec4(position, 0.0, 1.0);
+}
+</script>
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2 iResolution;
+uniform float iTime;
+
+#define SPEED .3
+#define FOV 1.5
+
+#define MAX_STEPS 80
+#define EPS .0002
+#define RENDER_DIST 10.
+#define AO_SAMPLES 4.
+#define AO_RANGE 10.
+
+#define PI 3.14159265359
+#define saturate(x) clamp(x, 0., 1.)
+
+float _twist = 0.;
+
+float hash(vec3 uv) {
+  float f = fract(sin(dot(uv ,vec3(.009123898,.00231233, .00532234)))* 111111.5452313);
+    return f;
+}
+
+float noise(vec3 uv) {
+    vec3 fuv = floor(uv);
+    vec4 cell0 = vec4(
+        hash(fuv + vec3(0, 0, 0)),
+        hash(fuv + vec3(0, 1, 0)),
+        hash(fuv + vec3(1, 0, 0)),
+        hash(fuv + vec3(1, 1, 0))
+    );
+    vec2 axis0 = mix(cell0.xz, cell0.yw, fract(uv.y));
+    float val0 = mix(axis0.x, axis0.y, fract(uv.x));
+    vec4 cell1 = vec4(
+        hash(fuv + vec3(0, 0, 1)),
+        hash(fuv + vec3(0, 1, 1)),
+        hash(fuv + vec3(1, 0, 1)),
+        hash(fuv + vec3(1, 1, 1))
+    );
+    vec2 axis1 = mix(cell1.xz, cell1.yw, fract(uv.y));
+    float val1 = mix(axis1.x, axis1.y, fract(uv.x));
+    return mix(val0, val1, fract(uv.z));
+}
+
+float fbm(vec3 uv) {
+    float f = 0.;
+    float r = 1.;
+    for (int i = 0; i < 5; ++i) {
+        f += noise((uv + 10.) * r) / (r *= 2.);
+    }
+    return f / (1. - 1. / r);
+}
+
+float fbm3(vec3 uv) {
+    float f = 0.;
+    float r = 1.;
+    for (int i = 0; i < 3; ++i) {
+        f += noise((uv + 10.) * r) / (r *= 2.);
+    }
+    return f / (1. - 1. / r);
+}
+
+void tRotate(inout vec2 p, float angel) {
+    float s = sin(angel), c = cos(angel);
+	p *= mat2(c, -s, s, c);
+}
+
+void tTwist(inout vec3 p, float a) {
+    tRotate(p.xy, p.z * a);
+}
+
+float tRepeat1(inout float p, float r) {
+    float id = floor((p + r * .5) / r);
+    p = mod(p + r * .5, r) - r * .5;
+    return id;
+}
+
+vec2 tRepeat2(inout vec2 p, vec2 r) {
+    vec2 id = floor((p + r * .5) / r);
+    p = mod(p + r * .5, r) - r * .5;
+    return id;
+}
+
+float sdRect(vec2 p, vec2 r) {
+    p = abs(p) - r;
+	return min(max(p.x, p.y), 0.) + length(max(p, 0.));
+}
+
+float sdCircle(vec2 p, float r) {
+    return length(p) - r;
+}
+
+float opU(float a, float b) {
+    return min(a, b);
+}
+
+float opS(float a, float b) {
+    return max(a, -b);
+}
+
+float map(vec3 p)
+{
+    tTwist(p, _twist);
+
+    vec3 warp = vec3(fbm3(p * 1.3), fbm3(p * 1.3 + 50.), fbm3(p * 1.3 + 90.)) - .5;
+    p += warp * .07;
+
+    tRepeat2(p.xz, vec2(.7, 1.));
+    p.x = abs(p.x);
+    p.y += .5;
+
+    float d = abs(p.z) - .15;
+
+    vec2 wp = p.xy - vec2(0., .78);
+    tRotate(wp, PI * .25);
+    float top = sdRect(wp, vec2(.17, .17));
+    float w = opU(top, sdRect(p.xy - vec2(0., .375), vec2(.25, .4)));
+    d = opS(d, w);
+
+    d = opS(d, sdRect(p.xy - vec2(0., .35), vec2(.45, .3)));
+
+    vec2 cp = p.xz - vec2(.35, 0.);
+    tRotate(cp, PI * .25);
+    d = opU(d, sdRect(cp, vec2(.08, .08)));
+
+    p.z = abs(p.z);
+
+    d = opS(d, sdRect(p.yz - vec2(.6, .5), vec2(.6, .4)));
+
+    d = opU(d, -abs(p.y - .5) + .8);
+
+    d += (.5 - fbm3(p * 9.)) * .05;
+    d += (.5 - noise(p * 40.)) * .015;
+
+    return d;
+}
+
+float trace(vec3 ro, vec3 rd, float maxDist, out float steps) {
+    float total = 0.;
+    steps = 0.;
+
+    for (int i = 0; i < MAX_STEPS; ++i) {
+        ++steps;
+        float d = map(ro + rd * total);
+        total += d * .75;
+        if (d < EPS || maxDist < total) break;
+    }
+
+    return total;
+}
+
+vec3 getNormal(vec3 p) {
+    const vec2 e = vec2(1., -1.) * .0001;
+    return normalize(
+        e.xyy * map(p + e.xyy) +
+        e.yyx * map(p + e.yyx) +
+        e.yxy * map(p + e.yxy) +
+        e.xxx * map(p + e.xxx)
+    );
+}
+
+float calculateAO(vec3 p, vec3 n) {
+    float r = 0., w = 1., d;
+    for (float i = 1.; i <= AO_SAMPLES; i++){
+        d = i / AO_SAMPLES / AO_RANGE;
+        r += w * (d - map(p + n * d));
+        w *= .5;
+    }
+    return 1.-saturate(r * AO_RANGE);
+}
+
+bool isWall(vec3 p) {
+    p.x += .35;
+    tRepeat2(p.xz, vec2(.7, 1));
+    return .375 < abs(p.y + .15) + length(p.xz);
+}
+
+vec3 _texture(vec3 p) {
+    vec3 t;
+    tTwist(p, _twist);
+    bool wall = isWall(p);
+
+    t = fbm((p + (wall ? 0. : .1 + .9 * fbm(p * 5.))) * vec3(5., 20., 5.)) * vec3(.42, .5, .58) * .85
+        + fbm(p * vec3(2., 10., 2.)) * vec3(.34, .42, .5) * .25;
+
+    t = pow(t, vec3(1.35));
+
+    if (wall) t = mix(t, vec3(.4, .45, .52), .3);
+    return saturate(t);
+}
+
+vec3 magicVeins(vec3 p) {
+    vec3 pt = p;
+    tTwist(pt, _twist);
+    bool wall = isWall(pt);
+
+    float vein = fbm(pt * vec3(6., 30., 6.) + iTime * .05);
+    vein = smoothstep(.56, .62, vein) * (wall ? 0. : 1.);
+
+    vec3 veinColor = mix(vec3(.65, .68, .74), vec3(.88, .9, .95), sin(iTime * .3 + p.y * 3.) * .5 + .5);
+    return vein * veinColor * 1.6;
+}
+
+vec3 dustGlow(vec3 ro, vec3 rd, float maxDist) {
+    vec3 glow = vec3(0.);
+    const int STEPS = 12;
+    float stepSize = maxDist / float(STEPS);
+    float t = stepSize * hash(rd * 17.3);
+
+    for (int i = 0; i < STEPS; i++) {
+        vec3 p = ro + rd * t;
+        p.y += iTime * .12;
+
+        vec3 cellId = floor(p * 4.);
+        vec3 cellUv = fract(p * 4.) - .5;
+        vec3 jitter = vec3(hash(cellId), hash(cellId + 7.1), hash(cellId + 13.7)) - .5;
+        float d = length(cellUv - jitter * .8);
+
+        float present = step(hash(cellId + 91.), .1);
+        float fade = 1. - smoothstep(maxDist * .5, maxDist, t);
+        float m = present * smoothstep(.06, 0., d) * fade;
+
+        glow += m * mix(vec3(.7, .74, .82), vec3(.87, .89, .95), hash(cellId + 3.));
+        t += stepSize;
+    }
+
+    return glow * .9;
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+	vec2 uv = fragCoord.xy / iResolution.xy * 2. - 1.;
+    uv.x *= iResolution.x / iResolution.y;
+
+    float time = iTime * SPEED;
+
+    _twist = sin(time) * .4;
+
+    vec3 ro = vec3(sin(time * PI / 2. + 1.) * 1., 0, time);
+    vec3 rd = normalize(vec3(uv, FOV));
+
+    time += 2.;
+    vec3 light = vec3(sin(time * PI / 2. + 1.) * 1., 0, time);
+    time -= 2.;
+
+    tRotate(rd.xz, -cos(time * PI / 2. + 1.) * .5);
+    tRotate(ro.xy, -ro.z * _twist);
+    tRotate(light.xy, -light.z * _twist);
+    tRotate(rd.xy, -ro.z * _twist);
+
+    float steps, dist = trace(ro, rd, RENDER_DIST, steps);
+
+    vec3 p = ro + rd * dist;
+    vec3 normal = getNormal(p);
+    vec3 l = normalize(light - p);
+
+    vec3 shadowStart = p + normal * EPS * 10.;
+    float shadowDistance = distance(shadowStart,light);
+    float shadowSteps, shadow = float(trace(shadowStart, l, shadowDistance, shadowSteps) > shadowDistance);
+    shadow *= 1. - sqrt(shadowSteps / float(MAX_STEPS));
+
+    float ambient = .06;
+    float diffuse = max(0., dot(l, normal));
+    float specular = pow(max(0., dot(reflect(-l, normal), -rd)), 8.);
+    float ao = calculateAO(p, normal);
+
+    float flicker = .93 + .07 * fbm(vec3(iTime * 1.2, 0., 0.));
+    vec3 lightCol = mix(vec3(.72, .75, .8), vec3(.85, .87, .9), sin(iTime * .17) * .5 + .5);
+
+    vec3 col = ao * _texture(p);
+	fragColor.rgb = col * ambient + col * (specular + diffuse) * shadow * flicker * lightCol;
+
+    fragColor.rgb += magicVeins(p) * ao;
+
+    fragColor.a = 1.;
+
+    fragColor.rgb *= sqrt(steps / 150.);
+
+    fragColor.rgb += dustGlow(ro, rd, dist);
+
+    fragColor = mix(fragColor, vec4(.03, .04, .07, 1.), saturate(dist * dist * .07));
+
+    vec2 q = fragCoord.xy / iResolution.xy;
+    fragColor.rgb *= .35 + .65 * pow(16. * q.x * q.y * (1. - q.x) * (1. - q.y), .3);
+
+    fragColor = pow(fragColor, vec4(1. / 2.2));
+    fragColor.a = 1. - dist / 10.;
+}
+
+void main() {
+  mainImage(gl_FragColor, gl_FragCoord.xy);
+}
+</script>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl');
+if (!gl) {
+  document.body.innerHTML = '<p style="color:white;font-family:sans-serif;padding:20px">WebGL not supported in this browser.</p>';
+}
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+const vsSrc = document.getElementById('vs').textContent;
+const fsSrc = document.getElementById('fs').textContent;
+const vs = compile(gl.VERTEX_SHADER, vsSrc);
+const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+
+const program = gl.createProgram();
+gl.attachShader(program, vs);
+gl.attachShader(program, fs);
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+  console.error(gl.getProgramInfoLog(program));
+}
+gl.useProgram(program);
+
+const posLoc = gl.getAttribLocation(program, 'position');
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1,   1, -1,   -1, 1,
+  -1, 1,    1, -1,    1, 1
+]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+const iResolutionLoc = gl.getUniformLocation(program, 'iResolution');
+const iTimeLoc = gl.getUniformLocation(program, 'iTime');
+
+const RENDER_SCALE = .75;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2) * RENDER_SCALE;
+  canvas.width = Math.round(window.innerWidth * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const start = performance.now();
+function render() {
+  const t = (performance.now() - start) / 1000;
+  gl.uniform2f(iResolutionLoc, canvas.width, canvas.height);
+  gl.uniform1f(iTimeLoc, t);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  requestAnimationFrame(render);
+}
+render();
+</script>
+</body>
+</html>
